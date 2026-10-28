@@ -8,11 +8,25 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from app.effects.base import NoOpEffectsAdapter
+from app.observability import failure
 from app.protect.webhook import csv
 
+# Hue reports the new state shortly after HA answers the service call.
+SETTLE_SECONDS = 0.5
+STOP_POLLS, STOP_POLL_SECONDS = 6, 0.25
+STOPPED = ('idle', 'off', 'standby', 'paused')
+APPEARANCE = ('brightness', 'color_mode', 'hs_color', 'xy_color', 'rgb_color', 'rgbw_color',
+              'rgbww_color', 'color_temp_kelvin', 'effect')
 
-def fingerprint(state):
-    return {k: deepcopy(state.get(k)) for k in ('state', 'attributes', 'last_updated', 'context')}
+
+def appearance(state):
+    """What a person sees, without timestamps/context that integrations rewrite on any update."""
+    attributes = state.get('attributes') or {}
+    return {'state': state.get('state'), **{k: deepcopy(attributes.get(k)) for k in APPEARANCE}}
+
+
+def context_id(state):
+    return (state.get('context') or {}).get('id')
 
 
 def quiet_hours(value, now):
@@ -42,8 +56,13 @@ class HomeAssistantEffectsAdapter(NoOpEffectsAdapter):
         return response.json()
 
     async def service(self, domain, action, data):
+        """Returns the context IDs of states HA changed during the call: those changes are ours."""
         response = await self.client.post(f'/api/services/{domain}/{action}', json=data)
         response.raise_for_status()
+        changed = response.json()
+        if isinstance(changed, dict):
+            changed = changed.get('changed_states', [])
+        return {context_id(state) for state in changed if isinstance(state, dict)} - {None}
 
     async def on_approach(self, session_id):
         if session_id in self.seen:
@@ -51,38 +70,37 @@ class HomeAssistantEffectsAdapter(NoOpEffectsAdapter):
         self.seen[session_id] = None
         if len(self.seen) > 128:
             self.seen.popitem(last=False)
-        lease = self.leases[session_id] = {'lights': {}, 'speaker_started': False, 'stop_task': None,
-                                          'speaker_safe': True, 'speaker_before': None, 'speaker_after': None,
+        lease = self.leases[session_id] = {'lights': {}, 'contexts': set(), 'speaker_started': False,
+                                          'stop_task': None, 'speaker_safe': True, 'speaker_before': None,
                                           'speaker_lock': asyncio.Lock()}
         # Snapshot every designated light before any changes. Do not touch anything on read failure.
         entities = sorted(csv(self.s.hue_controlled_entities))
-        before = {entity: await self.state(entity) for entity in entities}
+        before = dict(zip(entities, await asyncio.gather(*(self.state(entity) for entity in entities))))
         if any(state['state'] not in ('on', 'off') for state in before.values()):
             raise ValueError('Controlled light unavailable')
-        if self.s.hue_arrival_scene:
-            if not self.s.hue_scene_scope_confirmed:
-                raise ValueError('Scene porch scope must be confirmed')
-            await self.service('scene', 'turn_on', {'entity_id': self.s.hue_arrival_scene,
-                                                  'transition': self.s.effects_transition_seconds})
-        # Dispatch the group together, then observe settled state after the transition.
-        for index, entity in enumerate(entities):
-            if not self.s.hue_arrival_scene:
-                await self.service('light', 'turn_on', {'entity_id': entity,
-                    'rgb_color': [170, 65, 255] if index % 2 == 0 else [255, 130, 32],
-                    'brightness': max(160, before[entity]['attributes'].get('brightness') or 0),
-                    'transition': self.s.effects_transition_seconds})
-            # Record immediate ownership so cancellation can restore completed changes.
-            lease['lights'][entity] = (before[entity], fingerprint(await self.state(entity)))
-        await self.sleep(self.s.effects_transition_seconds)
+        if self.s.hue_arrival_scene and not self.s.hue_scene_scope_confirmed:
+            raise ValueError('Scene porch scope must be confirmed')
+        # Unsettled ownership (None) restores unconditionally if the visit ends mid-transition.
         for entity in entities:
-            after = await self.state(entity)
-            previous = lease['lights'][entity][1]
-            if after.get('context') != previous.get('context'):
-                # Ambiguous ownership, e.g. manual change during transition: leave it alone.
-                lease['lights'].pop(entity)
-                self.metrics['effects_restore_skipped_manual_change'] += 1
-            else:
-                lease['lights'][entity] = (before[entity], fingerprint(after))
+            lease['lights'][entity] = (before[entity], None)
+        if self.s.hue_arrival_scene:
+            lease['contexts'] |= await self.service('scene', 'turn_on', {
+                'entity_id': self.s.hue_arrival_scene, 'transition': self.s.effects_transition_seconds})
+        else:
+            for contexts in await asyncio.gather(*(
+                    self.service('light', 'turn_on', {'entity_id': entity,
+                        'rgb_color': [170, 65, 255] if index % 2 == 0 else [255, 130, 32],
+                        'brightness': max(160, before[entity]['attributes'].get('brightness') or 0),
+                        'transition': self.s.effects_transition_seconds})
+                    for index, entity in enumerate(entities))):
+                lease['contexts'] |= contexts
+        await self.sleep(self.s.effects_transition_seconds + SETTLE_SECONDS)
+        settled = await asyncio.gather(*(self.state(entity) for entity in entities))
+        for entity, after in zip(entities, settled):
+            # A new context here is the arrival effect landing (HA keeps the caller's context briefly).
+            if context_id(after) not in (None, context_id(before[entity])):
+                lease['contexts'].add(context_id(after))
+            lease['lights'][entity] = (before[entity], appearance(after))
         if self.s.effects_speaker_enabled and not quiet_hours(self.s.effects_quiet_hours, self.now()):
             await self._stinger(session_id, lease)
 
@@ -101,14 +119,14 @@ class HomeAssistantEffectsAdapter(NoOpEffectsAdapter):
         await self.service('media_player', 'play_media', {'entity_id': entity,
                            'media_content_id': self.s.effects_sound_url, 'media_content_type': 'music'})
         lease['stop_task'] = asyncio.create_task(self._auto_stop(session_id))
-        lease['speaker_after'] = fingerprint(await self.state(entity))
         self.metrics['effects_speaker_playbacks'] += 1
 
     async def _auto_stop(self, session_id):
         await asyncio.sleep(self.s.effects_max_duration_seconds)
         try:
             await self.before_speech(session_id)
-        except Exception:
+        except Exception as error:
+            failure('effects_stinger_stop', error)
             self.metrics['effects_speaker_stop_failures'] += 1
 
     async def before_speech(self, session_id):
@@ -133,8 +151,13 @@ class HomeAssistantEffectsAdapter(NoOpEffectsAdapter):
             # Another actor took over; don't interrupt it, but never open STT into it.
             return False
         await self.service('media_player', 'media_stop', {'entity_id': entity})
-        stopped = await self.state(entity)
-        if stopped['state'] not in ('idle', 'off', 'standby', 'paused'):
+        # The player reports the stop asynchronously; poll briefly before declaring audio unsafe.
+        for _ in range(STOP_POLLS):
+            stopped = await self.state(entity)
+            if stopped['state'] in STOPPED:
+                break
+            await self.sleep(STOP_POLL_SECONDS)
+        else:
             return False
         # Restore volume only when state still matches the setting owned by this effect.
         prior = lease['speaker_before']['attributes'].get('volume_level')
@@ -154,36 +177,41 @@ class HomeAssistantEffectsAdapter(NoOpEffectsAdapter):
         try:
             try:
                 await self.before_speech(session_id)
-            except Exception:
+            except Exception as error:
+                failure('effects_stinger_stop', error)
                 self.metrics['effects_speaker_stop_failures'] += 1
-            for entity, (before, owned) in lease['lights'].items():
-                try:
-                    current = await self.state(entity)
-                    if fingerprint(current) != owned:
-                        self.metrics['effects_restore_skipped_manual_change'] += 1
-                        continue
-                    attrs = before['attributes']
-                    data = {'entity_id': entity, 'transition': self.s.effects_transition_seconds}
-                    if before['state'] == 'on':
-                        if 'brightness' in attrs:
-                            data['brightness'] = attrs['brightness']
-                        mode = attrs.get('color_mode')
-                        key = {'hs': 'hs_color', 'xy': 'xy_color', 'rgb': 'rgb_color',
-                               'rgbw': 'rgbw_color', 'rgbww': 'rgbww_color',
-                               'color_temp': 'color_temp_kelvin'}.get(mode)
-                        if key and key in attrs:
-                            data[key] = attrs[key]
-                        await self.service('light', 'turn_on', data)
-                    else:
-                        await self.service('light', 'turn_off', data)
-                    self.metrics['effects_restore_success'] += 1
-                except Exception:
-                    self.metrics['effects_restore_failures'] += 1
+            await asyncio.gather(*(self._restore(lease, entity, before, owned)
+                                   for entity, (before, owned) in lease['lights'].items()))
         finally:
             task = lease['stop_task']
             if task:
                 task.cancel()
             self.leases.pop(session_id, None)
+
+    async def _restore(self, lease, entity, before, owned):
+        try:
+            current = await self.state(entity)
+            if owned is not None and appearance(current) != owned and context_id(current) not in lease['contexts']:
+                self.metrics['effects_restore_skipped_manual_change'] += 1
+                return
+            attrs = before['attributes']
+            data = {'entity_id': entity, 'transition': self.s.effects_transition_seconds}
+            if before['state'] == 'on':
+                if 'brightness' in attrs:
+                    data['brightness'] = attrs['brightness']
+                mode = attrs.get('color_mode')
+                key = {'hs': 'hs_color', 'xy': 'xy_color', 'rgb': 'rgb_color',
+                       'rgbw': 'rgbw_color', 'rgbww': 'rgbww_color',
+                       'color_temp': 'color_temp_kelvin'}.get(mode)
+                if key and key in attrs:
+                    data[key] = attrs[key]
+                await self.service('light', 'turn_on', data)
+            else:
+                await self.service('light', 'turn_off', data)
+            self.metrics['effects_restore_success'] += 1
+        except Exception as error:
+            failure('effects_restore', error)
+            self.metrics['effects_restore_failures'] += 1
 
     async def close(self):
         for session_id in list(self.leases):

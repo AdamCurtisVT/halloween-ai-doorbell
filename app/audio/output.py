@@ -1,23 +1,22 @@
 from pathlib import Path
-from typing import Protocol
 import wave
 
+# Approved cached assets stay short; generated speech may run longer at a slow character pace.
+MAX_ASSET_SECONDS = 10
+MAX_SPEECH_SECONDS = 15
 
-class AudioOutputAdapter(Protocol):
-    async def play(self, path: Path) -> None: ...
 
-
-def validate_test_wav(path: Path) -> dict:
+def validate_test_wav(path: Path, max_seconds: float = MAX_ASSET_SECONDS) -> dict:
     if not 44 <= path.stat().st_size <= 2_000_000:
         raise ValueError("Use a PCM WAV of at most 2 MB")
     with wave.open(str(path), "rb") as audio:
         frames, rate = audio.getnframes(), audio.getframerate()
         channels, width = audio.getnchannels(), audio.getsampwidth()
         duration = frames / rate if rate else 0
-        if (audio.getcomptype() != "NONE" or not 0 < duration <= 10
+        if (audio.getcomptype() != "NONE" or not 0 < duration <= max_seconds
                 or channels not in (1, 2) or width not in (1, 2, 3, 4)
                 or not 8000 <= rate <= 192000):
-            raise ValueError("Use a nonempty mono/stereo PCM WAV no longer than 10 seconds")
+            raise ValueError(f"Use a nonempty mono/stereo PCM WAV no longer than {max_seconds:g} seconds")
         expected_bytes = frames * channels * width
         if expected_bytes > 2_000_000 or len(audio.readframes(frames)) != expected_bytes:
             raise ValueError("WAV audio is truncated or exceeds the size limit")

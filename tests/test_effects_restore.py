@@ -143,11 +143,11 @@ async def test_effects_begin_before_inference_completes_and_ha_failure_does_not_
         raise ConnectionError('private HA URL')
     effects.on_approach = approach
     provider = fake_provider()
-    original = provider.vision.return_value
+    original = provider.greet.return_value
     async def vision(jpeg):
         await approached.wait()
         return original
-    provider.vision.side_effect = vision
+    provider.greet.side_effect = vision
     protect = Obj(snapshot=AsyncMock(return_value=b'jpeg'), play=AsyncMock())
     controller = SessionController(settings, protect, provider, effects=effects)
     await controller.run()
@@ -173,13 +173,68 @@ async def test_stinger_auto_stop_has_bounded_duration(ha):
     await adapter.close()
 
 
-async def test_no_restore_when_ha_restart_loses_ownership_context(ha):
+async def test_restore_when_only_context_changed_but_light_looks_owned(ha):
     _, states, calls, adapter = ha
+    before = deepcopy(states['light.porch']['attributes'])
     await adapter.on_approach('session')
+    # HA restart or an integration refresh rewrites context/last_updated without a visible change.
     states['light.porch']['context'] = {'id': 'after-ha-restart'}
+    states['light.porch']['last_updated'] = 'later'
     await adapter.on_end('session', 'completed')
-    assert len(calls) == 1  # Leave safe arrival lighting; never force a stale snapshot/off.
+    assert len(calls) == 2
+    assert states['light.porch']['attributes'] == before
     await adapter.close()
+
+
+async def test_restore_when_hue_reports_state_after_the_service_call(ha):
+    _, states, calls, adapter = ha
+    land = defer_state_updates(adapter, states)
+    before = deepcopy(states['light.porch']['attributes'])
+    await adapter.on_approach('session')
+    assert states['light.porch']['attributes']['brightness'] >= 160
+    await adapter.on_end('session', 'completed')
+    await land()
+    assert adapter.metrics['effects_restore_success'] == 1
+    assert states['light.porch']['attributes'] == before
+    await adapter.close()
+
+
+async def test_stinger_stop_reported_late_still_allows_listening(ha):
+    settings, states, calls, adapter = ha
+    settings.effects_speaker_enabled = settings.effects_speaker_dedicated = True
+    land = defer_state_updates(adapter, states)
+    await adapter.on_approach('session')
+    await land()
+    assert states['media_player.porch']['state'] == 'playing'
+    assert await adapter.before_speech('session')
+    assert states['media_player.porch']['state'] == 'idle'
+    await adapter.on_end('session', 'completed')
+    await adapter.close()
+
+
+def defer_state_updates(adapter, states):
+    """Real HA answers a service call before the integration reports the new state.
+    Service calls change `truth`; reads see it only after the adapter waits (or the test lands it)."""
+    truth = deepcopy(states)
+    handler = adapter.client._transport.handler
+    async def late(request):
+        if request.method == 'GET':
+            return await handler(request)
+        visible = deepcopy(states)
+        states.clear()
+        states.update(deepcopy(truth))
+        response = await handler(request)
+        truth.clear()
+        truth.update(deepcopy(states))
+        states.clear()
+        states.update(visible)
+        return response
+    async def land(*args):
+        states.clear()
+        states.update(deepcopy(truth))
+    adapter.client._transport.handler = late
+    adapter.sleep = land
+    return land
 
 
 async def test_same_session_from_multiple_sources_does_not_duplicate_effects(ha, tmp_path):
@@ -214,7 +269,7 @@ async def test_cancellation_restores_effects_in_finally(tmp_path):
     async def stall(jpeg):
         await asyncio.Event().wait()
     provider = fake_provider()
-    provider.vision.side_effect = stall
+    provider.greet.side_effect = stall
     controller = SessionController(settings, Obj(snapshot=AsyncMock(return_value=b'jpeg')), provider, effects=effects)
     task = asyncio.create_task(controller.run())
     await began.wait()
@@ -223,3 +278,34 @@ async def test_cancellation_restores_effects_in_finally(tmp_path):
         await task
     effects.on_end.assert_awaited_once()
     assert effects.on_end.call_args.args[1] == 'cancelled'
+
+
+async def test_arrival_and_end_get_the_longer_effects_limit():
+    from app.effects.base import EffectsCoordinator
+    adapter = NoOpEffectsAdapter()
+    async def slow(*args):
+        await asyncio.sleep(0.05)
+    adapter.on_approach = adapter.on_reply = slow
+    metrics = Counter()
+    coordinator = EffectsCoordinator(adapter, metrics, timeout=0.01, lifecycle_timeout=1)
+    await coordinator.invoke('on_approach', 'session')
+    await coordinator.invoke('on_reply', 'session')
+    assert metrics['effects_on_approach_success'] == 1
+    assert metrics['effects_degraded'] == 1
+
+
+async def test_concurrent_stinger_barriers_stop_only_once():
+    settings = Settings(_env_file=None, effects_speaker_entity_id='media_player.porch',
+                        effects_sound_url='http://assets.test/sound.wav')
+    adapter = HomeAssistantEffectsAdapter(settings, Counter(), client=Obj(aclose=AsyncMock()))
+    adapter.leases['session'] = {'speaker_started': True, 'stop_task': None,
+                                'speaker_lock': asyncio.Lock()}
+    async def stop(lease):
+        await asyncio.sleep(0)
+        lease['speaker_started'] = False
+        return True
+    adapter._stop_speaker = AsyncMock(side_effect=stop)
+    assert await asyncio.gather(adapter.before_speech('session'), adapter.before_speech('session')) == [True, True]
+    adapter._stop_speaker.assert_awaited_once()
+    adapter.leases.clear()
+    await adapter.close()

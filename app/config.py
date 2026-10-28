@@ -35,8 +35,9 @@ class Settings(BaseSettings):
     hue_arrival_scene: str = ""
     hue_scene_scope_confirmed: bool = False
     hue_controlled_entities: str = ""
-    hue_restore_mode: Literal["snapshot_conditional"] = "snapshot_conditional"
     effects_timeout_seconds: float = Field(default=3, gt=0, le=10)
+    # Arrival and end touch every light plus the speaker, and arrival waits out the transition.
+    effects_lifecycle_timeout_seconds: float = Field(default=8, gt=0, le=20)
     effects_transition_seconds: float = Field(default=1, ge=0.5, le=1.5)
     effects_speaker_enabled: bool = False
     effects_speaker_dedicated: bool = False
@@ -52,6 +53,7 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr = SecretStr("")
     openai_api_key_file: str = ""
     vision_model: str = ""
+    vision_detail: Literal["low", "high", "auto"] = "high"
     dialogue_model: str = ""
     stt_model: str = ""
     tts_model: str = ""
@@ -64,15 +66,22 @@ class Settings(BaseSettings):
     vad_onset_ms: int = Field(default=210, ge=30, le=1000)
     vad_silence_ms: int = Field(default=720, ge=30, le=2000)
     max_visitor_replies: int = Field(default=3, ge=1, le=3)
+    # Time allowed for the visitor to start speaking; the utterance itself may run up to 8 s more.
     listen_timeout_seconds: float = Field(default=8, gt=0, le=8)
     max_session_seconds: float = Field(default=45, gt=0, le=120)
+    # Another reply turn starts only with this much time left after the goodbye reserve.
+    min_turn_seconds: float = Field(default=12, ge=0, le=60)
+    # Time held back at the end of the session so the cached goodbye always plays.
+    goodbye_reserve_seconds: float = Field(default=6, ge=0, le=30)
     provider_timeout_seconds: float = Field(default=10, gt=0, le=30)
-    playback_timeout_seconds: float = Field(default=15, gt=0, le=30)
+    playback_timeout_seconds: float = Field(default=20, gt=0, le=30)
     cooldown_seconds: float = Field(default=30, ge=0)
     porch_clear_seconds: float = Field(default=10, ge=0)
     audio_echo_guard_ms: int = Field(default=400, ge=0, le=5000)
     fallback_wav: str = ""
     goodbye_wav: str = ""
+    # Optional cached line played immediately while the costume greeting is generated.
+    arrival_wav: str = ""
 
     # Explicit _FILE support works with Compose secrets and local private files.
     unifi_username_file: str = ""

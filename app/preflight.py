@@ -5,6 +5,7 @@ import shutil
 
 from app.audio.input import validate_stream
 from app.audio.output import validate_test_wav
+from app.protect.webhook import csv
 
 
 def required_fields(settings):
@@ -27,13 +28,19 @@ def local_checks(settings, which=shutil.which):
         value = value.get_secret_value() if hasattr(value, 'get_secret_value') else value
         checks.append({'check': name.upper(), 'status': 'pass' if value else 'fail',
                        'detail': 'configured' if value else 'required_for_activation'})
-    for name in ('fallback_wav', 'goodbye_wav'):
+    for name in ('fallback_wav', 'goodbye_wav', 'arrival_wav'):
+        if name == 'arrival_wav' and not settings.arrival_wav:
+            continue
         try:
-            validate_test_wav(Path(getattr(settings, name)))
+            seconds = validate_test_wav(Path(getattr(settings, name)))['seconds']
             state = 'pass'
         except Exception:
             state = 'fail'
         checks.append({'check': name.upper() + '_FORMAT', 'status': state, 'detail': 'short_pcm_wav_required'})
+        if name == 'goodbye_wav' and state == 'pass':
+            fits = seconds + 1 <= settings.goodbye_reserve_seconds
+            checks.append({'check': 'goodbye_reserve', 'status': 'pass' if fits else 'fail',
+                           'detail': 'reserve_covers_goodbye' if fits else 'reserve_must_exceed_goodbye_by_1s'})
     for tool in ('ffmpeg', 'ffprobe'):
         checks.append({'check': tool, 'status': 'pass' if which(tool) else 'fail', 'detail': 'executable_on_path'})
     if settings.conversation_mode == 'interactive':
@@ -49,6 +56,9 @@ def local_checks(settings, which=shutil.which):
         checks.append({'check': 'webhook_token_length',
                        'status': 'pass' if len(settings.unifi_webhook_token.get_secret_value()) >= 32 else 'fail',
                        'detail': 'at_least_32_characters_required'})
+        single = len(csv(settings.unifi_webhook_allowed_camera_ids)) == 1
+        checks.append({'check': 'webhook_camera_scope', 'status': 'pass' if single else 'fail',
+                       'detail': 'exactly_one_doorbell_device_required'})
     if settings.effects_enabled:
         configured = bool(settings.home_assistant_token.get_secret_value() and settings.hue_controlled_entities)
         checks.append({'check': 'home_assistant_effects', 'status': 'pass' if configured else 'warning',

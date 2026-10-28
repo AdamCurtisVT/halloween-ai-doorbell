@@ -19,7 +19,7 @@ Preflight exits 1 until all required configuration, short approved WAVs and FFmp
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.runtime.yml build
-docker compose -f docker-compose.yml -f docker-compose.runtime.yml run --rm spike python -m scripts.preflight
+docker compose -f docker-compose.yml -f docker-compose.runtime.yml run --rm doorbell python -m scripts.preflight
 ```
 
 Use `.env.example` and `docs/runtime.md` to fill missing settings. `FALLBACK_WAV` and `GOODBYE_WAV` must use container paths when testing in Docker. Select account-supported models from current official documentation; no model capability is inferred from its name.

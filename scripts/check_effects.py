@@ -18,7 +18,8 @@ async def main():
         raise ValueError('HA token and explicit controlled light IDs required')
     metrics = Counter()
     adapter = HomeAssistantEffectsAdapter(settings, metrics)
-    coordinator = EffectsCoordinator(adapter, metrics, settings.effects_timeout_seconds)
+    coordinator = EffectsCoordinator(adapter, metrics, settings.effects_timeout_seconds,
+                                      settings.effects_lifecycle_timeout_seconds)
     session_id = uuid.uuid4().hex
     try:
         for entity in csv(settings.hue_controlled_entities):

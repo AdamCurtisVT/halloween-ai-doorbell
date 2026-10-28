@@ -57,26 +57,47 @@ async def test_silence_never_transcribes(setup):
 
 async def test_final_flag_does_not_discard_audio(setup):
     c = setup
-    c.provider.reply.side_effect = [Reply(response_text='Welcome!', tone='friendly', ends_conversation=False),
-                                   Reply(response_text='Have fun!', tone='friendly', ends_conversation=True)]
+    c.provider.reply.side_effect = [Reply(response_text='Have fun!', tone='friendly', ends_conversation=True)]
     await c.run()
     assert c.microphone.listen_count == 1
     assert c.protect.play.await_count == 3  # greeting, reply, guaranteed goodbye
 
 
-@pytest.mark.parametrize('failure', ['vision', 'reply', 'synthesize', 'transcribe', 'play'])
+@pytest.mark.parametrize('failure', ['greet', 'reply', 'synthesize', 'transcribe', 'play'])
 async def test_stage_failures_cleanup_and_fallback(setup, failure):
     c = setup
     target = c.protect if failure == 'play' else c.provider
     getattr(target, failure).side_effect = RuntimeError('private detail')
     await c.run()
     assert not c.history and not c.microphone.gate
-    if failure in {'reply', 'synthesize', 'play'}:
+    if failure in {'synthesize', 'play'}:
         assert c.microphone.listen_count == 0
     if failure == 'play':
         assert c.metrics['sessions_failed'] == 1
-    if failure == 'vision':
+    if failure == 'greet':
+        # Without a costume, a plain dialogue greeting still opens the conversation.
         assert c.provider.reply.call_args_list[0].args[0].certainty == 'unknown'
+    if failure == 'reply':
+        assert c.microphone.listen_count == 1
+        assert c.protect.play.call_args.args[0] == Path(c.settings.goodbye_wav)
+
+
+async def test_greeting_falls_back_to_cached_audio_when_generation_fails(setup):
+    c = setup
+    c.provider.greet.side_effect = RuntimeError('refused')
+    c.provider.reply.side_effect = RuntimeError('refused')
+    await c.run()
+    c.protect.play.assert_awaited_once_with(Path(c.settings.fallback_wav))
+    assert c.microphone.listen_count == 0
+
+
+async def test_failures_record_stage_and_type_without_message(setup):
+    from app.observability import RECENT
+    c = setup
+    c.provider.transcribe.side_effect = RuntimeError('private transcript detail')
+    await c.run()
+    assert RECENT[-1]['stage'] == 'listen' and RECENT[-1]['error'] == 'RuntimeError'
+    assert 'private' not in str(list(RECENT))
 
 
 async def test_mic_degraded_greeting_only(setup):
@@ -92,7 +113,7 @@ async def test_unintelligible_closes_without_reply(setup):
     c = setup
     c.provider.transcribe.return_value = ''
     await c.run()
-    assert c.provider.reply.await_count == 1
+    assert c.provider.reply.await_count == 0
     assert c.metrics['unintelligible'] == 1
 
 
@@ -102,7 +123,7 @@ async def test_deadline_and_cancel_clear_history(setup):
     async def stalled(*args):
         started.set()
         await asyncio.Event().wait()
-    c.provider.reply.side_effect = stalled
+    c.provider.greet.side_effect = stalled
     c.settings.max_session_seconds = 0.02
     await c.run()
     assert c.last_result == 'deadline'
@@ -154,7 +175,7 @@ async def test_detection_end_does_not_imply_departure_but_explicit_cancel_works(
     async def stall(*args):
         started.set()
         await asyncio.Event().wait()
-    c.provider.vision.side_effect = stall
+    c.provider.greet.side_effect = stall
     manager = SessionManager(c.settings, c)
     manager.submit(event('person'))
     await started.wait()
@@ -234,9 +255,11 @@ async def test_websocket_disconnect_terminates_subscription():
     unsub_state.assert_called_once()
 
 
-async def test_third_reply_deadline_cannot_open_fourth_listen(setup):
+async def test_turn_running_out_of_time_still_says_goodbye(setup):
     c = setup
-    c.settings.max_session_seconds = 0.03
+    c.settings.max_session_seconds = 0.5
+    c.settings.goodbye_reserve_seconds = 0.4
+    c.settings.min_turn_seconds = 0
     original = c.provider.reply.return_value
     async def reply(costume, history, final):
         if final:
@@ -244,9 +267,43 @@ async def test_third_reply_deadline_cannot_open_fourth_listen(setup):
         return original
     c.provider.reply.side_effect = reply
     await c.run()
-    assert c.last_result == 'deadline'
+    assert c.last_result == 'completed'
+    assert c.metrics['turns_cut_for_time'] == 1
     assert c.microphone.listen_count == 3
+    assert c.protect.play.call_args.args[0] == Path(c.settings.goodbye_wav)
     assert not c.microphone.gate and not c.history
+
+
+async def test_no_new_turn_without_time_for_a_full_exchange(setup):
+    c = setup
+    c.settings.min_turn_seconds = 60
+    await c.run()
+    assert c.microphone.listen_count == 0
+    assert c.metrics['turns_skipped_for_time'] == 1
+    assert c.protect.play.call_args.args[0] == Path(c.settings.goodbye_wav)
+
+
+async def test_arrival_line_plays_while_greeting_is_generated(setup, tmp_path):
+    c = setup
+    arrival = tmp_path / 'arrival.wav'
+    fixture_wav(arrival)
+    c.settings.arrival_wav = str(arrival)
+    c.microphone.utterances = [None]
+    greeting_started = asyncio.Event()
+    original = c.provider.greet.return_value
+    async def greet(jpeg):
+        greeting_started.set()
+        await asyncio.sleep(0.01)
+        return original
+    c.provider.greet.side_effect = greet
+    played = []
+    async def play(path):
+        await asyncio.sleep(0.005)  # Real talkback streams for a while.
+        played.append((path, greeting_started.is_set()))
+    c.protect.play.side_effect = play
+    await c.run()
+    assert played[0] == (arrival, True)  # Generation ran during the arrival line.
+    assert played[1][0] != arrival
 
 
 async def test_echo_guard_precedes_open_gate(setup):
@@ -284,3 +341,32 @@ async def test_real_vad_silence_does_not_become_speech():
     mic.open_gate()
     mic.feed(bytes(FRAME_BYTES))
     assert await mic.listen(0.01) is None
+
+
+async def test_late_speech_onset_is_not_cut_off_at_the_start_deadline():
+    vad = Obj(is_speech=lambda frame, rate: frame[0] == 1)
+    mic = LiveMicrophone('rtsp://u:p@camera/stream', vad=vad, onset_ms=30, silence_ms=60)
+    mic.healthy = True
+    mic.open_gate()
+    async def visitor():
+        await asyncio.sleep(0.03)
+        for _ in range(10):  # Speech continues well past the 0.05 s start window.
+            mic.feed(b'\x01' * FRAME_BYTES)
+            await asyncio.sleep(0.01)
+        for _ in range(2):
+            mic.feed(bytes(FRAME_BYTES))
+    speaking = asyncio.create_task(visitor())
+    pcm = await mic.listen(0.05)
+    await speaking
+    assert len(pcm) == 12 * FRAME_BYTES
+
+
+async def test_status_reports_idle_without_rearming(setup):
+    from app.runtime import Runtime
+    manager = SessionManager(setup.settings, setup, clock=lambda: 100)
+    manager.armed = False
+    setup.state = State.COOLDOWN
+    runtime = Runtime(setup.settings)
+    runtime.manager, runtime.enabled = manager, True
+    assert runtime.status()['state'] == 'IDLE'
+    assert not manager.armed and setup.state == State.COOLDOWN

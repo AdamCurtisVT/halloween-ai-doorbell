@@ -7,7 +7,7 @@ name = "halloween-ai-doorbell"
 version = "0.1.0"
 description = "Halloween doorbell with gated hardware adapters and half-duplex sessions"
 requires-python = ">=3.12,<3.13"
-dependencies = ["fastapi==0.162.0", "uvicorn==0.54.0", "pydantic-settings==2.16.2", "uiprotect==25.0.0", "openai==3.40.0", "webrtcvad-wheels==2.0.14.post1", "httpx==0.28.1"]
+dependencies = ["fastapi==0.162.0", "uvicorn==0.54.0", "pydantic-settings==2.16.2", "uiprotect==25.0.0", "openai==3.40.0", "av==19.0.2", "webrtcvad-wheels==2.0.14.post1", "httpx==0.28.1"]
 
 [project.optional-dependencies]
 test = ["pytest==9.2.0", "pytest-asyncio==1.4.1", "httpx==0.28.1"]

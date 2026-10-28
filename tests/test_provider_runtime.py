@@ -1,11 +1,12 @@
 import asyncio
 from pathlib import Path
+import wave
 from types import SimpleNamespace as Obj
 from unittest.mock import AsyncMock, Mock
 import pytest
 from fastapi.testclient import TestClient
 
-from app.ai.contracts import Costume, Reply
+from app.ai.contracts import Costume, Greeting, Reply
 from app.ai.openai_provider import OpenAIProvider, RULES
 from app.config import Settings
 from app.main import create_app
@@ -25,16 +26,24 @@ def provider():
     return OpenAIProvider(settings, client)
 
 
-async def test_vision_payload_has_no_server_storage(provider):
-    provider.client.responses.parse.return_value = Obj(output_parsed=Costume.unknown())
-    result = await provider.vision(b'jpeg')
+async def test_greeting_payload_has_no_server_storage_and_is_moderated(provider):
+    greeting = Greeting(costume=Costume.unknown(),
+                        greeting=Reply(response_text='Happy Halloween!', tone='playful', ends_conversation=False))
+    provider.client.responses.parse.return_value = Obj(output_parsed=greeting)
+    result = await provider.greet(b'jpeg')
     request = provider.client.responses.parse.call_args.kwargs
     assert request['store'] is False
-    assert request['input'][0]['content'][1]['image_url'].startswith('data:image/jpeg;base64,')
-    assert result.certainty == 'unknown'
+    image = request['input'][0]['content'][1]
+    assert image['image_url'].startswith('data:image/jpeg;base64,')
+    assert image['detail'] == 'high'
+    assert result.costume.certainty == 'unknown'
+    assert provider.client.moderations.create.call_args.kwargs['input'] == 'Happy Halloween!'
+    provider.client.moderations.create.return_value = Obj(results=[Obj(flagged=True)])
+    with pytest.raises(ValueError):
+        await provider.greet(b'jpeg')
     provider.client.responses.parse.return_value = Obj(output_parsed=None)
     with pytest.raises(ValueError):
-        await provider.vision(b'jpeg')
+        await provider.greet(b'jpeg')
 
 
 async def test_injection_stays_untrusted_and_output_is_moderated(provider):
@@ -53,12 +62,16 @@ async def test_injection_stays_untrusted_and_output_is_moderated(provider):
         await provider.reply(Costume.unknown(), [], False)
 
 
-async def test_tts_format_stt_in_memory_and_sdk_close(provider, tmp_path):
-    wav = tmp_path / 'fixture.wav'
-    fixture_wav(wav)
-    provider.client.audio.speech.create.return_value = Obj(content=wav.read_bytes())
+async def test_tts_pcm_is_wrapped_stt_in_memory_and_sdk_close(provider, tmp_path):
+    # 12 s of 24 kHz speech: longer than a cached asset may be, within the generated limit.
+    provider.client.audio.speech.create.return_value = Obj(content=bytes(24000 * 2 * 12))
     await provider.synthesize('Happy Halloween!', tmp_path / 'speech.wav')
-    assert provider.client.audio.speech.create.call_args.kwargs['response_format'] == 'wav'
+    assert provider.client.audio.speech.create.call_args.kwargs['response_format'] == 'pcm'
+    with wave.open(str(tmp_path / 'speech.wav'), 'rb') as audio:
+        assert (audio.getframerate(), audio.getnchannels(), audio.getnframes()) == (24000, 1, 24000 * 12)
+    provider.client.audio.speech.create.return_value = Obj(content=bytes(24000 * 2 * 16))
+    with pytest.raises(ValueError):
+        await provider.synthesize('Happy Halloween!', tmp_path / 'long.wav')
     provider.client.audio.transcriptions.create.return_value = Obj(text='hello')
     assert await provider.transcribe(bytes(6400)) == 'hello'
     request = provider.client.audio.transcriptions.create.call_args.kwargs
@@ -154,3 +167,20 @@ async def test_runtime_event_to_session_and_shutdown(monkeypatch, tmp_path):
     await runtime.close()
     assert closed.is_set() and not runtime.connected
     provider.close.assert_awaited_once()
+
+
+async def test_shutdown_permanently_blocks_enable_but_disable_does_not():
+    runtime = Runtime(Settings(_env_file=None))
+    runtime.validate = lambda: None
+    async def wait():
+        await asyncio.Event().wait()
+    runtime._supervise = wait
+    await runtime.enable()
+    await asyncio.sleep(0)
+    await runtime.disable()
+    await runtime.enable()
+    await asyncio.sleep(0)
+    await runtime.close()
+    with pytest.raises(ValueError, match='shutting down'):
+        await runtime.enable()
+    assert runtime.task is None

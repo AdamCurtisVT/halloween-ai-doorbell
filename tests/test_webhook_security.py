@@ -1,8 +1,10 @@
 import asyncio
 from collections import Counter
+import json
 import time
 from types import SimpleNamespace as Obj
 from fastapi.testclient import TestClient
+import httpx
 import pytest
 from app.config import Settings
 from app.protect.webhook import create_webhook_app, normalize, WebhookInbox
@@ -114,3 +116,25 @@ async def test_webhook_runtime_dispatches_without_opening_websocket(setup):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+async def test_disable_during_streamed_body_rejects_at_enqueue_boundary():
+    settings = Settings(_env_file=None, unifi_camera_id='camera',
+                        unifi_webhook_token='x' * 40, unifi_webhook_allowed_source_ips='192.0.2.10',
+                        unifi_webhook_allowed_camera_ids='device', unifi_webhook_allowed_alarm_names='porch',
+                        unifi_webhook_allowed_triggers='person')
+    runtime = Obj(enabled=True, connected=True, manager=object(), metrics=Counter())
+    runtime.inbox = WebhookInbox(settings, runtime.metrics)
+    import time
+    payload = json.dumps({'timestamp': int(time.time() * 1000), 'alarm': {'name': 'porch',
+                         'triggers': [{'device': 'device', 'key': 'person'}]}}).encode()
+    async def body():
+        yield payload[:10]
+        runtime.enabled = False
+        yield payload[10:]
+    transport = httpx.ASGITransport(app=create_webhook_app(settings, runtime), client=('192.0.2.10', 1234))
+    async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+        response = await client.post('/webhooks/unifi', content=body(),
+                                     headers={'X-Unifi-Token': 'x' * 40, 'Content-Type': 'application/json'})
+    assert response.status_code == 503
+    assert runtime.inbox.queue.empty()

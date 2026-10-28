@@ -1,5 +1,5 @@
 services:
-  spike:
+  doorbell:
     build: .
     env_file: .env
     ports:

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 import wave
 
-from app.ai.contracts import Costume, Reply
+from app.ai.contracts import Costume, Greeting, Reply
 from app.config import Settings
 from app.sessions.controller import SessionController
 
@@ -42,7 +42,8 @@ def fake_provider():
     async def synthesize(text, path):
         fixture_wav(path)
     return SimpleNamespace(
-        vision=AsyncMock(return_value=Costume.unknown()),
+        greet=AsyncMock(return_value=Greeting(costume=Costume.unknown(), greeting=Reply(
+            response_text='Welcome, mysterious visitor!', tone='friendly', ends_conversation=False))),
         reply=AsyncMock(return_value=Reply(response_text='What a lovely Halloween evening!',
                                           tone='friendly', ends_conversation=False)),
         synthesize=AsyncMock(side_effect=synthesize),

@@ -2,6 +2,8 @@ import asyncio
 import time
 from typing import Protocol
 
+from app.observability import failure
+
 
 class EffectsAdapter(Protocol):
     async def on_approach(self, session_id): ...
@@ -21,19 +23,24 @@ class NoOpEffectsAdapter:
 
 
 class EffectsCoordinator:
-    def __init__(self, adapter, metrics, timeout=3):
-        self.adapter, self.metrics, self.timeout = adapter, metrics, timeout
+    # Arrival and end touch every light and the speaker; the other hooks are single calls.
+    LIFECYCLE = ('on_approach', 'on_end')
+
+    def __init__(self, adapter, metrics, timeout=3, lifecycle_timeout=8):
+        self.adapter, self.metrics = adapter, metrics
+        self.timeout, self.lifecycle_timeout = timeout, lifecycle_timeout
         self.approach = None
         self.audio_safe = True
 
     async def invoke(self, method, *args):
         started = time.monotonic()
         try:
-            async with asyncio.timeout(self.timeout):
+            async with asyncio.timeout(self.lifecycle_timeout if method in self.LIFECYCLE else self.timeout):
                 result = await getattr(self.adapter, method)(*args)
             self.metrics['effects_' + method + '_success'] += 1
             return result
-        except Exception:
+        except Exception as error:
+            failure('effects_' + method, error)
             self.metrics['effects_degraded'] += 1
             return False
         finally:

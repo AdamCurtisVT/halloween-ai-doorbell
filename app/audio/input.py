@@ -1,4 +1,4 @@
-"""Bounded, opt-in microphone spike; no continuous recording or cloud provider."""
+"""Bounded, opt-in microphone diagnostic; no continuous recording or cloud provider."""
 import asyncio
 import json
 import re

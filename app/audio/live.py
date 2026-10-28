@@ -5,8 +5,10 @@ from contextlib import suppress
 from urllib.parse import urlsplit
 import webrtcvad
 from app.audio.input import validate_stream
+from app.observability import failure
 
 FRAME_BYTES = 960  # 30 ms, 16 kHz mono s16le; supported by WebRTC VAD.
+MAX_UTTERANCE_BYTES = 8 * 32000  # 8 s, matching the transcription input bound.
 
 
 class MicrophoneFailure(RuntimeError):
@@ -75,7 +77,8 @@ class LiveMicrophone:
                     self.feed(frame)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as error:
+                failure('microphone', error)
                 self.healthy = False
                 self.generation += 1
                 self.close_gate()
@@ -91,7 +94,9 @@ class LiveMicrophone:
             delay = min(delay * 2, 30)
 
     async def listen(self, seconds=8):
-        """None = silence; b'' is never returned; transport failure is an exception."""
+        """Wait up to `seconds` for speech to start, then record until trailing silence or
+        MAX_UTTERANCE_BYTES, so a visitor who starts late is not cut off.
+        None = silence; b'' is never returned; transport failure is an exception."""
         generation = self.generation
         onset = deque(maxlen=self.onset_frames)
         utterance = bytearray()
@@ -99,11 +104,11 @@ class LiveMicrophone:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + seconds
         try:
-            while loop.time() < deadline:
+            while (remaining := deadline - loop.time()) > 0:
                 if not self.healthy or generation != self.generation:
                     raise MicrophoneFailure("Microphone stream interrupted")
                 try:
-                    frame = await asyncio.wait_for(self.frames.get(), min(0.2, deadline - loop.time()))
+                    frame = await asyncio.wait_for(self.frames.get(), min(0.2, remaining))
                 except TimeoutError:
                     continue
                 voiced = self.vad.is_speech(frame, 16000)
@@ -114,12 +119,14 @@ class LiveMicrophone:
                         onset.clear()
                     if len(onset) == onset.maxlen:
                         utterance.extend(b"".join(onset))
+                        # Frames arrive in real time; the margin only guards a stalled stream.
+                        deadline = loop.time() + MAX_UTTERANCE_BYTES / 32000 + 1
                 else:
                     utterance.extend(frame)
                     silence = 0 if voiced else silence + 1
-                    if silence >= self.silence_frames or len(utterance) >= 8 * 32000:  # ~720 ms tail
-                        return bytes(utterance[:8 * 32000])
-            return bytes(utterance[:8 * 32000]) if utterance else None
+                    if silence >= self.silence_frames or len(utterance) >= MAX_UTTERANCE_BYTES:
+                        return bytes(utterance[:MAX_UTTERANCE_BYTES])
+            return bytes(utterance[:MAX_UTTERANCE_BYTES]) if utterance else None
         finally:
             self.close_gate()
 

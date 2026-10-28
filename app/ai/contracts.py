@@ -37,8 +37,15 @@ class Reply(BaseModel):
         return text
 
 
+class Greeting(BaseModel):
+    """Costume description and opening line from one vision call, saving a model round trip."""
+    model_config = ConfigDict(extra="forbid")
+    costume: Costume
+    greeting: Reply
+
+
 class Provider(Protocol):
-    async def vision(self, jpeg: bytes) -> Costume: ...
+    async def greet(self, jpeg: bytes) -> Greeting: ...
     async def reply(self, costume: Costume, history: list[dict], final: bool) -> Reply: ...
     async def synthesize(self, text: str, path: Path) -> None: ...
     async def transcribe(self, pcm: bytes) -> str: ...

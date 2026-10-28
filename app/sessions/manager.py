@@ -17,11 +17,14 @@ class SessionManager:
         self.enabled = True
         self.task = None
 
-    def rearm(self):
+    def can_rearm(self):
         now = self.clock()
-        if (now >= self.cooldown_until
+        return (now >= self.cooldown_until
                 and now - self.last_activity >= self.settings.porch_clear_seconds
-                and (self.task is None or self.task.done())):
+                and (self.task is None or self.task.done()))
+
+    def rearm(self):
+        if self.can_rearm():
             self.armed = True
             self.controller.state = State.IDLE
 

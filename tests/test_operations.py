@@ -1,6 +1,10 @@
 import asyncio
 from contextlib import asynccontextmanager
+import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 from types import SimpleNamespace as Obj
 from unittest.mock import AsyncMock, Mock
 
@@ -15,7 +19,7 @@ from app.runtime import Runtime
 from app.sessions.manager import SessionManager
 from app.sessions.controller import SessionController
 from app.ai.openai_provider import OpenAIProvider
-from app.ai.contracts import Costume, Reply
+from app.ai.contracts import Costume, Greeting, Reply
 from scripts.control import loopback_url
 from scripts.simulate import fixture_wav, fake_provider
 
@@ -180,9 +184,12 @@ def test_quality_is_bounded_and_handles_real_jpeg():
 @pytest.mark.parametrize('personality', ['haunted_butler', 'friendly_witch', 'silly_skeleton'])
 async def test_personas_keep_safety_rules(configured, personality):
     configured.personality = personality
-    client = Obj(responses=Obj(parse=AsyncMock(return_value=Obj(output_parsed=Costume.unknown()))))
+    greeting = Greeting(costume=Costume.unknown(),
+                        greeting=Reply(response_text='Happy Halloween!', tone='playful', ends_conversation=False))
+    client = Obj(responses=Obj(parse=AsyncMock(return_value=Obj(output_parsed=greeting))),
+                 moderations=Obj(create=AsyncMock(return_value=Obj(results=[Obj(flagged=False)]))))
     provider = OpenAIProvider(configured, client)
-    await provider.vision(b'jpeg')
+    await provider.greet(b'jpeg')
     instructions = client.responses.parse.call_args.kwargs['instructions']
     assert 'never identify' in instructions
     assert 'untrusted data' in instructions
@@ -212,3 +219,45 @@ async def test_activation_with_invalid_media_returns_configuration_error(configu
     Path(configured.fallback_wav).write_bytes(b'not a wave file')
     with pytest.raises(ValueError, match='Approved short PCM WAV'):
         await Runtime(configured).enable()
+
+
+def test_activation_requires_goodbye_reserve_and_a_single_webhook_device(configured):
+    configured.goodbye_reserve_seconds = 0.5
+    with pytest.raises(ValueError, match='GOODBYE_RESERVE'):
+        Runtime(configured).validate()
+    webhook = configured.model_copy(update={
+        'trigger_source': 'webhook', 'unifi_webhook_allowed_camera_ids': 'doorbell,garage',
+        'unifi_webhook_allowed_source_ips': '192.0.2.10', 'unifi_webhook_allowed_alarm_names': 'porch',
+        'unifi_webhook_allowed_triggers': 'person'})
+    webhook.unifi_webhook_token = type(configured.control_api_token)('x' * 40)
+    with pytest.raises(ValueError, match='exactly one'):
+        Runtime(webhook).validate()
+    checks = {item['check']: item['status'] for item in local_checks(webhook, which=lambda name: name)}
+    assert checks['webhook_camera_scope'] == 'fail'
+
+
+@pytest.mark.skipif(not shutil.which('docker'), reason='Compose CLI unavailable')
+@pytest.mark.parametrize('overrides,expected', [([], set()),
+    (['docker-compose.microphone-secret.yml'], {'UNIFI_AUDIO_STREAM_URL_FILE'}),
+    (['docker-compose.ha-secret.yml'], {'HOME_ASSISTANT_TOKEN_FILE'}),
+    (['docker-compose.microphone-secret.yml', 'docker-compose.ha-secret.yml'],
+     {'UNIFI_AUDIO_STREAM_URL_FILE', 'HOME_ASSISTANT_TOKEN_FILE'})])
+def test_optional_compose_secret_mounts_and_empty_quiet_hours(overrides, expected):
+    root = Path(__file__).resolve().parents[1]
+    command = ['docker', 'compose', '-f', 'docker-compose.secrets.yml']
+    for name in overrides:
+        command += ['-f', name]
+    command += ['config', '--format', 'json']
+    result = subprocess.run(command, cwd=root, capture_output=True, text=True, check=True,
+                            env={**os.environ, 'UNIFI_HOST': 'example.invalid', 'EFFECTS_QUIET_HOURS': ''})
+    service = json.loads(result.stdout)['services']['doorbell']
+    optional = {'UNIFI_AUDIO_STREAM_URL_FILE', 'HOME_ASSISTANT_TOKEN_FILE'}
+    assert optional.intersection(service['environment']) == expected
+    assert service['environment']['EFFECTS_QUIET_HOURS'] == ''
+
+
+def test_preflight_explains_disabled_optional_effects():
+    settings = Settings(_env_file=None, hue_arrival_scene='scene.porch', effects_speaker_enabled=True)
+    warnings = {item['check'] for item in local_checks(settings, which=lambda name: name)
+                if item['status'] == 'warning'}
+    assert {'home_assistant_effects', 'hue_scene_scope', 'effects_speaker'} <= warnings

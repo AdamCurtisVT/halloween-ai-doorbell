@@ -12,6 +12,7 @@ from app.main import create_app
 from app.protect.client import UiprotectAdapter, connect
 from app.audio.input import FFmpegInput, DiagnosticError, phrase_matches, run_process, validate_stream
 from app.audio.output import validate_test_wav
+from scripts.simulate import fixture_wav
 
 
 def settings(**kwargs):
@@ -282,3 +283,14 @@ def test_local_transcription_uses_only_local_model(tmp_path):
     factory.assert_called_once_with(str(model_dir.resolve()), device='cpu', compute_type='int8', local_files_only=True)
     with pytest.raises(ValueError):
         transcribe(wav, tmp_path / 'nonexistent', factory)
+
+
+def test_wav_rejects_truncated_audio_and_oversized_file(tmp_path):
+    path = tmp_path / 'truncated.wav'
+    fixture_wav(path)
+    path.write_bytes(path.read_bytes()[:-2])
+    with pytest.raises(ValueError, match='truncated'):
+        validate_test_wav(path)
+    path.write_bytes(bytes(2_000_001))
+    with pytest.raises(ValueError, match='2 MB'):
+        validate_test_wav(path)
