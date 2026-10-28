@@ -1,0 +1,3 @@
+# Optional offline spike helper, not part of the service image or main lock.
+# Install in a separate Python 3.12 virtualenv; no models are downloaded here.
+faster-whisper==1.2.1

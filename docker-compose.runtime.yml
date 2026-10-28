@@ -1,0 +1,7 @@
+# Optional media mount for either base Compose file. Set FALLBACK_WAV and GOODBYE_WAV
+# to /media/fallback.wav and /media/goodbye.wav in the container configuration.
+services:
+  spike:
+    volumes:
+      - ./artifacts/fallback.wav:/media/fallback.wav:ro
+      - ./artifacts/goodbye.wav:/media/goodbye.wav:ro
